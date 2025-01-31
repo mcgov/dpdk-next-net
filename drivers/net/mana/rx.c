@@ -120,6 +120,10 @@ mana_alloc_and_post_rx_wqes(struct mana_rxq *rxq, uint32_t count)
 	int ret;
 	uint32_t i, batch_count;
 	struct rte_mbuf *mbufs[MANA_MBUF_BULK];
+	if (rxq->wqe_cnt_to_short_db > 0)
+		DP_LOG(DEBUG, "rxq wqe short db count was != 0");
+
+	rxq->wqe_cnt_to_short_db = 0;
 
 more_mbufs:
 	batch_count = RTE_MIN(count, MANA_MBUF_BULK);
@@ -132,9 +136,6 @@ more_mbufs:
 		goto out;
 	}
 
-#ifdef RTE_ARCH_32
-	rxq->wqe_cnt_to_short_db = 0;
-#endif
 	for (i = 0; i < batch_count; i++) {
 		ret = mana_post_rx_wqe(rxq, mbufs[i]);
 		if (ret) {
@@ -145,12 +146,11 @@ more_mbufs:
 			goto out;
 		}
 
-#ifdef RTE_ARCH_32
 		if (rxq->wqe_cnt_to_short_db > RX_WQE_SHORT_DB_THRESHOLD) {
 			mana_rq_ring_doorbell(rxq);
 			rxq->wqe_cnt_to_short_db = 0;
 		}
-#endif
+
 	}
 
 	count -= batch_count;
@@ -448,10 +448,6 @@ mana_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 	uint32_t i;
 	int polled = 0;
 
-#ifdef RTE_ARCH_32
-	rxq->wqe_cnt_to_short_db = 0;
-#endif
-
 repoll:
 	/* Polling on new completions if we have no backlog */
 	if (rxq->comp_buf_idx == rxq->comp_buf_len) {
@@ -570,25 +566,6 @@ drop:
 		wqe_consumed++;
 		if (pkt_received == pkts_n)
 			break;
-
-#ifdef RTE_ARCH_32
-		/* Always post WQE as soon as it's consumed for short DB */
-		ret = mana_alloc_and_post_rx_wqes(rxq, wqe_consumed);
-		if (ret) {
-			DRV_LOG(ERR, "failed to post %d WQEs, ret %d",
-				wqe_consumed, ret);
-			return pkt_received;
-		}
-		wqe_consumed = 0;
-
-		/* Ring short doorbell if approaching the wqe increment
-		 * limit.
-		 */
-		if (rxq->wqe_cnt_to_short_db > RX_WQE_SHORT_DB_THRESHOLD) {
-			mana_rq_ring_doorbell(rxq);
-			rxq->wqe_cnt_to_short_db = 0;
-		}
-#endif
 	}
 
 	rxq->backlog_idx = pkt_idx;
