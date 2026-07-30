@@ -231,8 +231,20 @@ void	hn_dev_free_queues(struct rte_eth_dev *dev);
 static inline struct rte_eth_dev *
 hn_get_vf_dev(const struct hn_data *hv)
 {
-	if (hv->vf_ctx.vf_attached)
-		return &rte_eth_devices[hv->vf_ctx.vf_port];
+	uint16_t vf_port = hv->vf_ctx.vf_port;
+
+	/*
+	 * vf_attached is not sufficient on its own: during
+	 * rte_eal_cleanup() the bus teardown order can release the
+	 * underlying VF port (e.g. PCI bus cleanup) before the netvsc
+	 * device is removed. That resets the VF's rte_eth_dev
+	 * (state UNUSED, data == NULL) while vf_attached is still set,
+	 * so dereferencing vf_dev->data would crash. Confirm the port
+	 * is still attached before handing it back.
+	 */
+	if (hv->vf_ctx.vf_attached &&
+	    rte_eth_devices[vf_port].state == RTE_ETH_DEV_ATTACHED)
+		return &rte_eth_devices[vf_port];
 	else
 		return NULL;
 }
