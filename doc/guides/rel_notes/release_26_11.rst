@@ -70,6 +70,12 @@ New Features
   * Added VF support on AMD Solarflare X45xx adapters.
 
 
+* **Updated NXP ENETC4 PMD.**
+
+  Updated the NXP ENETC4 poll mode driver for i.MX95:
+
+  * Added KEEP_CRC Rx offload support for the ENETC4 PMD to preserve the Ethernet FCS.
+
 Removed Items
 -------------
 
