@@ -1378,6 +1378,9 @@ static void mana_reset_exit(struct mana_priv *priv);
 /* Delay before initiating reset exit after reset enter completes */
 #define MANA_RESET_TIMER_US (15 * 1000000ULL) /* 15 seconds */
 
+/* Maximum time to keep retrying the PCI probe during reset exit */
+#define MANA_RESET_PROBE_TIMEOUT_SEC (10 * 60)
+
 /*
  * Callback for PCI device removal events from EAL.
  * If the device is in reset (RESET_EXIT state), this means the PCI
@@ -1496,12 +1499,13 @@ mana_reset_thread(void *arg)
 
 	pthread_mutex_lock(&priv->reset_cond_mutex);
 	while (rte_atomic_load_explicit(&priv->dev_state,
-	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+			rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
 		if (pthread_cond_timedwait(&priv->reset_cond,
-		    &priv->reset_cond_mutex, &ts))
+			&priv->reset_cond_mutex, &ts))
 			break; /* timeout */
 	}
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
+
 
 	pthread_mutex_lock(&priv->reset_ops_lock);
 
@@ -1634,6 +1638,8 @@ mana_reset_exit_delay(void *arg)
 	int i;
 	struct rte_eth_dev *dev;
 	struct rte_pci_device *pci_dev;
+	uint64_t deadline;
+
 
 	DRV_LOG(DEBUG, "Delayed mana device reset complete processing");
 
@@ -1661,15 +1667,52 @@ mana_reset_exit_delay(void *arg)
 	}
 	priv->ib_ctx = NULL;
 
-	ret = mana_pci_probe(NULL, pci_dev);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
+	// arbitrary timeout deadline before we stop retrying
+	deadline = rte_get_timer_cycles() +
+				MANA_RESET_PROBE_TIMEOUT_SEC * rte_get_timer_hz();
+
+	/* Retry probe until the device reappears or 10-minute timeout. */
+	while (true) {
+		// attempt to probe; break on success
+		ret = mana_pci_probe(NULL, pci_dev);
+		if (ret == 0)
+		break;
+
+		DRV_LOG(DEBUG, "Failed to probe mana pci dev ret %d", ret);
+		/*
+			NOTE: The whole probe or retry operation is
+							time-boxed to 10 minutes.
+							This is entirely arbitrary.
+		*/
+		if ((int64_t)(rte_get_timer_cycles() - deadline) >= 0) {
+		DRV_LOG(ERR, "Timed out after %d seconds probing mana pci dev",
+				MANA_RESET_PROBE_TIMEOUT_SEC);
 		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-				     rte_memory_order_release);
+									rte_memory_order_release);
 		goto out;
+		}
+
+		i = 40;
+		do {
+		// check whether the retry has been cancelled
+		// to avoid delaying a graceful shutdown that would
+		// otherwise be blocked for the entire wait.
+		int dev_state = rte_atomic_load_explicit(&priv->dev_state,
+													rte_memory_order_acquire);
+		if (dev_state != MANA_DEV_RESET_EXIT) {
+			DRV_LOG(INFO, "Probe retry cancelled, dev_state changed");
+			ret = -ECANCELED;
+			goto out;
+		}
+		// check again every 250ms * 40 attempts,
+		// around 10s before the next probe attempt.
+		rte_delay_ms(250);
+		} while (i-- > 0);
 	}
 
-	/*
+	// probe success
+
+    /*
 	 * Init the local MR caches.
 	 */
 	for (i = 0; i < priv->num_queues; i++) {
@@ -1755,7 +1798,13 @@ mr_init_failed_rxq:
 out:
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
-	if (!ret) {
+	if (ret == -ECANCELED) {
+		/* Cancelled by dev_stop/dev_close — caller owns teardown,
+		 * do not send recovery events.
+		 */
+		DRV_LOG(INFO, "Reset exit cancelled for port %u",
+			priv->port_id);
+	} else if (!ret) {
 		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
 			priv->port_id);
 		rte_eth_dev_callback_process(dev,
