@@ -1431,7 +1431,7 @@ mana_reset_thread(void *arg)
 	struct timespec ts;
 	int ret;
 	int i;
-	int reset_attempts = 4;
+	int reset_attempts = 5;
 
 	DRV_LOG(INFO, "Reset thread started");
 
@@ -1489,36 +1489,35 @@ mana_reset_thread(void *arg)
 	 * This avoids losing a condvar signal that arrived before
 	 * we entered the wait.
 	 */
-MANA_RESET_RETRY:
-	DRV_LOG(INFO, "Waiting %us for hardware recovery",
-		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
+	while (reset_attempts--){ 
+		DRV_LOG(INFO, "Waiting %us for hardware recovery",
+			(unsigned int)(MANA_RESET_TIMER_US / 1000000));
 
-	clock_gettime(CLOCK_REALTIME, &ts);
-	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
 
-	pthread_mutex_lock(&priv->reset_cond_mutex);
-	while (rte_atomic_load_explicit(&priv->dev_state,
-	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
-		if (pthread_cond_timedwait(&priv->reset_cond,
-		    &priv->reset_cond_mutex, &ts))
-			break; /* timeout */
-	}
-	pthread_mutex_unlock(&priv->reset_cond_mutex);
+		pthread_mutex_lock(&priv->reset_cond_mutex);
+		while (rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+			if (pthread_cond_timedwait(&priv->reset_cond,
+				&priv->reset_cond_mutex, &ts))
+				break; /* timeout */
+		}
+		pthread_mutex_unlock(&priv->reset_cond_mutex);
 
-	pthread_mutex_lock(&priv->reset_ops_lock);
+		pthread_mutex_lock(&priv->reset_ops_lock);
 
-	if (rte_atomic_load_explicit(&priv->dev_state,
-	    rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-		DRV_LOG(INFO, "Reset thread: dev_state=%d, %s",
-			(int)rte_atomic_load_explicit(
-				&priv->dev_state,
-				rte_memory_order_acquire),
-			reset_tries > 0 ? "retrying..." : "timeout. exiting.");
-		pthread_mutex_unlock(&priv->reset_ops_lock);
-		if reset_attempts-- > 0
-			goto MANA_RESET_RETRY;
+		if (rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
+			DRV_LOG(INFO, "Reset thread: dev_state=%d, %s",
+				(int)rte_atomic_load_explicit(
+					&priv->dev_state,
+					rte_memory_order_acquire),
+				"retrying...");
+			pthread_mutex_unlock(&priv->reset_ops_lock);
+		}
 		else
-			return 0;
+			break;
 	}
 
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
