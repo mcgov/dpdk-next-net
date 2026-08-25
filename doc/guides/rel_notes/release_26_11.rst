@@ -91,6 +91,12 @@ New Features
   * Added Tx PAUSE support for the ENETC4 VF via Rx congestion mode.
   * Added WRR Tx scheduler devarg (``enetc4_txq_wrr``) for ENETC4 VF ring weights.
 
+* **Updated NXP dpaa2 driver.**
+
+  * Added the inner IP header to the RSS hash so tunnelled traffic is
+    distributed across the Rx queues.
+
+
 Removed Items
 -------------
 
