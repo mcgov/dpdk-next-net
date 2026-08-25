@@ -1504,7 +1504,7 @@ mana_reset_thread(void *arg)
 					pthread_mutex_unlock(&priv->reset_cond_mutex);
 					DRV_LOG(INFO, "reset condition timed out, %s", 
 						reset_attempts ? "retrying." : "continue");
-					continue; /* timeout */
+					break; /* timeout */
 				}
 		}
 		
@@ -1667,13 +1667,18 @@ mana_reset_exit_delay(void *arg)
 		goto out;
 	}
 	priv->ib_ctx = NULL;
-
-	ret = mana_pci_probe(NULL, pci_dev);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
-		rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-				     rte_memory_order_release);
-		goto out;
+	struct timespec ts;
+	pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+	while (1) {
+		ret = mana_pci_probe(NULL, pci_dev);
+		if (ret) {
+			DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
+			rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
+						rte_memory_order_release);
+			rte_pause();
+		} else {
+			break;
+		}
 	}
 
 	/*
