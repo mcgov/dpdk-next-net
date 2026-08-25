@@ -1499,12 +1499,13 @@ mana_reset_thread(void *arg)
 
 	pthread_mutex_lock(&priv->reset_cond_mutex);
 	while (rte_atomic_load_explicit(&priv->dev_state,
-	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+			rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
 		if (pthread_cond_timedwait(&priv->reset_cond,
-		    &priv->reset_cond_mutex, &ts))
+			&priv->reset_cond_mutex, &ts))
 			break; /* timeout */
 	}
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
+
 
 	pthread_mutex_lock(&priv->reset_ops_lock);
 
@@ -1669,20 +1670,29 @@ mana_reset_exit_delay(void *arg)
 	// retry probe for 10 minutes
 	deadline = rte_get_timer_cycles() +
 		   MANA_RESET_PROBE_TIMEOUT_SEC * rte_get_timer_hz();
+	
 	while (true) {
 		ret = mana_pci_probe(NULL, pci_dev);
 		if (ret == 0)
 			break;
-
+		
 		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
-
-		if ((int64_t)(rte_get_timer_cycles()  >= deadline)) {
+		
+		// check if DPDK is shutting down	
+		if (rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
+			ret = -ECANCELED;
+			goto out;
+		}
+	
+		if ((int64_t)(rte_get_timer_cycles() - deadline) >= 0) {
 			DRV_LOG(ERR,
 				"Timed out after %u seconds probing mana pci dev",
 				MANA_RESET_PROBE_TIMEOUT_SEC);
 			rte_atomic_store_explicit(&priv->dev_state,
 						  MANA_DEV_RESET_FAILED,
 						  rte_memory_order_release);
+						  
 			goto out;
 		}
 		// wait 5 seconds and retry probe until timeout
