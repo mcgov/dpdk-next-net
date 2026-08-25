@@ -1500,25 +1500,26 @@ mana_reset_thread(void *arg)
 		while (rte_atomic_load_explicit(&priv->dev_state,
 			rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
 			if (pthread_cond_timedwait(&priv->reset_cond,
-				&priv->reset_cond_mutex, &ts))
-				break; /* timeout */
+				&priv->reset_cond_mutex, &ts)){
+					pthread_mutex_unlock(&priv->reset_cond_mutex);
+					DRV_LOG(INFO, "reset condition timed out, %s", 
+						reset_attempts ? "retrying." : "continue");
+					continue; /* timeout */
+				}
 		}
-		pthread_mutex_unlock(&priv->reset_cond_mutex);
-
-		pthread_mutex_lock(&priv->reset_ops_lock);
+		
+	}
+	pthread_mutex_unlock(&priv->reset_cond_mutex);
+	pthread_mutex_lock(&priv->reset_ops_lock);
 
 		if (rte_atomic_load_explicit(&priv->dev_state,
 			rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-			DRV_LOG(INFO, "Reset thread: dev_state=%d, %s",
+			DRV_LOG(INFO, "Reset thread: dev_state=%d, failed.",
 				(int)rte_atomic_load_explicit(
 					&priv->dev_state,
-					rte_memory_order_acquire),
-				"retrying...");
+					rte_memory_order_acquire));
 			pthread_mutex_unlock(&priv->reset_ops_lock);
 		}
-		else
-			break;
-	}
 
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
