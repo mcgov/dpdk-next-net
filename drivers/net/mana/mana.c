@@ -1378,6 +1378,9 @@ static void mana_reset_exit(struct mana_priv *priv);
 /* Delay before initiating reset exit after reset enter completes */
 #define MANA_RESET_TIMER_US (15 * 1000000ULL) /* 15 seconds */
 
+/* Maximum time to keep retrying the PCI probe during reset exit */
+#define MANA_RESET_PROBE_TIMEOUT_SEC (10 * 60)
+
 /*
  * Callback for PCI device removal events from EAL.
  * If the device is in reset (RESET_EXIT state), this means the PCI
@@ -1431,7 +1434,6 @@ mana_reset_thread(void *arg)
 	struct timespec ts;
 	int ret;
 	int i;
-	int reset_attempts = 5;
 
 	DRV_LOG(INFO, "Reset thread started");
 
@@ -1489,37 +1491,31 @@ mana_reset_thread(void *arg)
 	 * This avoids losing a condvar signal that arrived before
 	 * we entered the wait.
 	 */
-	while (reset_attempts--){ 
-		DRV_LOG(INFO, "Waiting %us for hardware recovery",
-			(unsigned int)(MANA_RESET_TIMER_US / 1000000));
+	DRV_LOG(INFO, "Waiting %us for hardware recovery",
+		(unsigned int)(MANA_RESET_TIMER_US / 1000000));
 
-		clock_gettime(CLOCK_REALTIME, &ts);
-		ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += MANA_RESET_TIMER_US / 1000000;
 
-		pthread_mutex_lock(&priv->reset_cond_mutex);
-		while (rte_atomic_load_explicit(&priv->dev_state,
-			rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
-			if (pthread_cond_timedwait(&priv->reset_cond,
-				&priv->reset_cond_mutex, &ts)){
-					pthread_mutex_unlock(&priv->reset_cond_mutex);
-					DRV_LOG(INFO, "reset condition timed out, %s", 
-						reset_attempts ? "retrying." : "continue");
-					break; /* timeout */
-				}
-		}
-		
+	pthread_mutex_lock(&priv->reset_cond_mutex);
+	while (rte_atomic_load_explicit(&priv->dev_state,
+	       rte_memory_order_acquire) == MANA_DEV_RESET_EXIT) {
+		if (pthread_cond_timedwait(&priv->reset_cond,
+		    &priv->reset_cond_mutex, &ts))
+			break; /* timeout */
 	}
 	pthread_mutex_unlock(&priv->reset_cond_mutex);
+
 	pthread_mutex_lock(&priv->reset_ops_lock);
 
-		if (rte_atomic_load_explicit(&priv->dev_state,
-			rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-			DRV_LOG(INFO, "Reset thread: dev_state=%d, failed.",
-				(int)rte_atomic_load_explicit(
-					&priv->dev_state,
-					rte_memory_order_acquire));
-			pthread_mutex_unlock(&priv->reset_ops_lock);
-		}
+	if (rte_atomic_load_explicit(&priv->dev_state,
+	    rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
+		DRV_LOG(INFO, "Reset thread: dev_state=%d, skipping exit",
+			(int)rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire));
+		pthread_mutex_unlock(&priv->reset_ops_lock);
+		return 0;
+	}
 
 	DRV_LOG(INFO, "Reset thread: initiating reset exit");
 	mana_reset_exit(priv);
@@ -1641,6 +1637,8 @@ mana_reset_exit_delay(void *arg)
 	int i;
 	struct rte_eth_dev *dev;
 	struct rte_pci_device *pci_dev;
+	uint64_t deadline;
+
 
 	DRV_LOG(DEBUG, "Delayed mana device reset complete processing");
 
@@ -1667,18 +1665,28 @@ mana_reset_exit_delay(void *arg)
 		goto out;
 	}
 	priv->ib_ctx = NULL;
-	struct timespec ts;
-	pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-	while (1) {
+
+	// retry probe for 10 minutes
+	deadline = rte_get_timer_cycles() +
+		   MANA_RESET_PROBE_TIMEOUT_SEC * rte_get_timer_hz();
+	while (true) {
 		ret = mana_pci_probe(NULL, pci_dev);
-		if (ret) {
-			DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
-			rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
-						rte_memory_order_release);
-			rte_pause();
-		} else {
+		if (ret == 0)
 			break;
+
+		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
+
+		if ((int64_t)(rte_get_timer_cycles()  >= deadline)) {
+			DRV_LOG(ERR,
+				"Timed out after %u seconds probing mana pci dev",
+				MANA_RESET_PROBE_TIMEOUT_SEC);
+			rte_atomic_store_explicit(&priv->dev_state,
+						  MANA_DEV_RESET_FAILED,
+						  rte_memory_order_release);
+			goto out;
 		}
+		// wait 5 seconds and retry probe until timeout
+		rte_delay_ms(5 * MS_PER_S);
 	}
 
 	/*
