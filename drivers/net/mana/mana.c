@@ -1667,36 +1667,45 @@ mana_reset_exit_delay(void *arg)
 	}
 	priv->ib_ctx = NULL;
 
-	// retry probe for 10 minutes
+	/* Retry probe until the device reappears or 10-minute timeout. */
 	deadline = rte_get_timer_cycles() +
 		   MANA_RESET_PROBE_TIMEOUT_SEC * rte_get_timer_hz();
-	
+
 	while (true) {
 		ret = mana_pci_probe(NULL, pci_dev);
 		if (ret == 0)
 			break;
-		
-		DRV_LOG(ERR, "Failed to probe mana pci dev ret %d", ret);
-		
-		// check if DPDK is shutting down	
-		if (rte_atomic_load_explicit(&priv->dev_state,
-			rte_memory_order_acquire) != MANA_DEV_RESET_EXIT) {
-			ret = -ECANCELED;
-			goto out;
-		}
-	
+
+		DRV_LOG(DEBUG, "Failed to probe mana pci dev ret %d", ret);
+
+		/* Check timeout. */
 		if ((int64_t)(rte_get_timer_cycles() - deadline) >= 0) {
 			DRV_LOG(ERR,
-				"Timed out after %u seconds probing mana pci dev",
+				"Timed out after %d seconds probing mana pci dev",
 				MANA_RESET_PROBE_TIMEOUT_SEC);
 			rte_atomic_store_explicit(&priv->dev_state,
 						  MANA_DEV_RESET_FAILED,
 						  rte_memory_order_release);
-						  
 			goto out;
 		}
-		// wait 5 seconds and retry probe until timeout
-		rte_delay_ms(5 * MS_PER_S);
+
+		/*
+		 * Sleep in short intervals so we respond promptly to
+		 * cancellation via dev_state (e.g. dev_close/dev_stop
+		 * calling mana_join_reset_thread sets ACTIVE).
+		 */
+		for (int wait_ms = 0; wait_ms < 5 * MS_PER_S;
+		     wait_ms += 100) {
+			if (rte_atomic_load_explicit(&priv->dev_state,
+				rte_memory_order_acquire) !=
+			    MANA_DEV_RESET_EXIT) {
+				DRV_LOG(INFO,
+					"Probe retry cancelled, dev_state changed");
+				ret = -ECANCELED;
+				goto out;
+			}
+			rte_delay_ms(100);
+		}
 	}
 
 	/*
@@ -1785,7 +1794,13 @@ mr_init_failed_rxq:
 out:
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
-	if (!ret) {
+	if (ret == -ECANCELED) {
+		/* Cancelled by dev_stop/dev_close — caller owns teardown,
+		 * do not send recovery events.
+		 */
+		DRV_LOG(INFO, "Reset exit cancelled for port %u",
+			priv->port_id);
+	} else if (!ret) {
 		DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_SUCCESS for port %u",
 			priv->port_id);
 		rte_eth_dev_callback_process(dev,
@@ -2535,7 +2550,7 @@ mana_pci_probe(struct rte_pci_driver *pci_drv __rte_unused,
 		rte_spinlock_unlock(&mana_shared_data_lock);
 		return -ENODEV;
 	}
-
+      
 	/* At least one eth_dev is probed, increase counter for shared data */
 	rte_spinlock_lock(&mana_shared_data_lock);
 	if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
