@@ -14,6 +14,7 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -38,6 +39,8 @@
 #include <rte_ethdev.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
+#include <rte_ip.h>
+#include <rte_icmp.h>
 #include <rte_string_fns.h>
 #include <rte_cycles.h>
 
@@ -51,6 +54,8 @@
 
 #define PARAM_PROC_ID "proc-id"
 #define PARAM_NUM_PROCS "num-procs"
+#define PARAM_REWRITE_ICMP "rewrite-icmp"
+#define PARAM_PEER_MAC "peer-mac"
 
 /* for each lcore, record the elements of the ports array to use */
 struct lcore_ports{
@@ -71,6 +76,10 @@ static unsigned num_procs = 0;
 
 static uint16_t ports[RTE_MAX_ETHPORTS];
 static unsigned num_ports = 0;
+static bool rewrite_icmp;
+static bool peer_eth_addr_set[RTE_MAX_ETHPORTS];
+static struct rte_ether_addr peer_eth_addr[RTE_MAX_ETHPORTS];
+static struct rte_ether_addr port_eth_addr[RTE_MAX_ETHPORTS];
 
 static struct lcore_ports lcore_ports[RTE_MAX_LCORE];
 static struct port_stats pstats[RTE_MAX_ETHPORTS];
@@ -82,15 +91,38 @@ smp_usage(const char *prgname, const char *errmsg)
 	printf("\nError: %s\n",errmsg);
 	printf("\n%s [EAL options] -- -p <port mask> "
 			"--"PARAM_NUM_PROCS" <n>"
-			" --"PARAM_PROC_ID" <id>\n"
+			" --"PARAM_PROC_ID" <id>"
+			" [--"PARAM_REWRITE_ICMP
+			" --"PARAM_PEER_MAC" <port>,<mac> ...]\n"
 			"-p         : a hex bitmask indicating what ports are to be used\n"
 			"--num-procs: the number of processes which will be used\n"
 			"--proc-id  : the id of the current process (id < num-procs)\n"
+			"--rewrite-icmp: rewrite Ethernet addresses on IPv4 ICMP echo packets\n"
+			"--peer-mac: destination MAC for ICMP echo packets sent on a port\n"
 			"\n",
 			prgname);
 	exit(1);
 }
 
+static int
+parse_peer_eth_addr(const char *arg)
+{
+	char *end;
+	unsigned long port;
+
+	errno = 0;
+	port = strtoul(arg, &end, 0);
+	if (errno != 0 || end == arg || *end != ',' || port >= RTE_MAX_ETHPORTS)
+		return -EINVAL;
+	if (peer_eth_addr_set[port])
+		return -EEXIST;
+	if (rte_ether_unformat_addr(end + 1, &peer_eth_addr[port]) != 0 ||
+			!rte_is_valid_assigned_ether_addr(&peer_eth_addr[port]))
+		return -EINVAL;
+
+	peer_eth_addr_set[port] = true;
+	return 0;
+}
 
 /* signal handler configured for SIGTERM and SIGINT to print stats on exit */
 static void
@@ -115,9 +147,12 @@ smp_parse_args(int argc, char **argv)
 	int option_index;
 	uint16_t i, port_mask = 0;
 	char *prgname = argv[0];
+	bool peer_mac_seen = false;
 	static struct option lgopts[] = {
 			{PARAM_NUM_PROCS, 1, 0, 0},
 			{PARAM_PROC_ID, 1, 0, 0},
+			{PARAM_REWRITE_ICMP, 0, 0, 0},
+			{PARAM_PEER_MAC, 1, 0, 0},
 			{NULL, 0, 0, 0}
 	};
 
@@ -136,6 +171,13 @@ smp_parse_args(int argc, char **argv)
 				num_procs = atoi(optarg);
 			else if (strncmp(lgopts[option_index].name, PARAM_PROC_ID, 7) == 0)
 				proc_id = atoi(optarg);
+			else if (strcmp(lgopts[option_index].name, PARAM_REWRITE_ICMP) == 0)
+				rewrite_icmp = true;
+			else if (strcmp(lgopts[option_index].name, PARAM_PEER_MAC) == 0) {
+				if (parse_peer_eth_addr(optarg) != 0)
+					smp_usage(prgname, "Invalid or duplicate peer-mac parameter\n");
+				peer_mac_seen = true;
+			}
 			break;
 
 		default:
@@ -152,11 +194,19 @@ smp_parse_args(int argc, char **argv)
 		smp_usage(prgname, "Invalid or missing num-procs parameter\n");
 	if (port_mask == 0)
 		smp_usage(prgname, "Invalid or missing port mask\n");
+	if (!rewrite_icmp && peer_mac_seen)
+		smp_usage(prgname, "peer-mac requires rewrite-icmp\n");
 
 	/* get the port numbers from the port mask */
 	RTE_ETH_FOREACH_DEV(i)
 		if(port_mask & (1 << i))
 			ports[num_ports++] = (uint8_t)i;
+	if (rewrite_icmp) {
+		for (i = 0; i < num_ports; i++)
+			if (!peer_eth_addr_set[ports[i]])
+				smp_usage(prgname,
+					"rewrite-icmp requires a peer-mac for every enabled port\n");
+	}
 
 	ret = optind-1;
 	optind = 1; /* reset getopt lib */
@@ -308,6 +358,75 @@ assign_ports_to_cores(void)
 	}
 }
 
+static bool
+is_icmp_echo(const struct rte_mbuf *m)
+{
+	struct rte_ether_hdr eth_buf;
+	struct rte_vlan_hdr vlan_buf;
+	struct rte_ipv4_hdr ip_buf;
+	struct rte_icmp_hdr icmp_buf;
+	const struct rte_ether_hdr *eth_hdr;
+	const struct rte_vlan_hdr *vlan_hdr;
+	const struct rte_ipv4_hdr *ip_hdr;
+	const struct rte_icmp_hdr *icmp_hdr;
+	uint32_t offset;
+	uint16_t ether_type;
+	uint16_t fragment_offset;
+	uint8_t ip_hdr_len;
+	unsigned int i;
+
+	eth_hdr = rte_pktmbuf_read(m, 0, sizeof(*eth_hdr), &eth_buf);
+	if (eth_hdr == NULL)
+		return false;
+
+	offset = sizeof(*eth_hdr);
+	ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
+	for (i = 0; i < 2 && (ether_type == RTE_ETHER_TYPE_VLAN ||
+			ether_type == RTE_ETHER_TYPE_QINQ); i++) {
+		vlan_hdr = rte_pktmbuf_read(m, offset, sizeof(*vlan_hdr), &vlan_buf);
+		if (vlan_hdr == NULL)
+			return false;
+		offset += sizeof(*vlan_hdr);
+		ether_type = rte_be_to_cpu_16(vlan_hdr->eth_proto);
+	}
+	if (ether_type != RTE_ETHER_TYPE_IPV4)
+		return false;
+
+	ip_hdr = rte_pktmbuf_read(m, offset, sizeof(*ip_hdr), &ip_buf);
+	if (ip_hdr == NULL || (ip_hdr->version_ihl >> 4) != 4 ||
+			ip_hdr->next_proto_id != IPPROTO_ICMP)
+		return false;
+
+	ip_hdr_len = rte_ipv4_hdr_len(ip_hdr);
+	fragment_offset = rte_be_to_cpu_16(ip_hdr->fragment_offset);
+	if (ip_hdr_len < sizeof(*ip_hdr) ||
+			(fragment_offset & RTE_IPV4_HDR_OFFSET_MASK) != 0 ||
+			rte_be_to_cpu_16(ip_hdr->total_length) <
+				ip_hdr_len + sizeof(*icmp_hdr))
+		return false;
+
+	icmp_hdr = rte_pktmbuf_read(m, offset + ip_hdr_len,
+			sizeof(*icmp_hdr), &icmp_buf);
+	if (icmp_hdr == NULL || icmp_hdr->icmp_code != 0)
+		return false;
+
+	return icmp_hdr->icmp_type == RTE_ICMP_TYPE_ECHO_REQUEST ||
+		icmp_hdr->icmp_type == RTE_ICMP_TYPE_ECHO_REPLY;
+}
+
+static void
+rewrite_icmp_eth_addr(struct rte_mbuf *m, uint16_t dst_port)
+{
+	struct rte_ether_hdr *eth_hdr;
+
+	if (rte_pktmbuf_data_len(m) < sizeof(*eth_hdr) || !is_icmp_echo(m))
+		return;
+
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+	rte_ether_addr_copy(&peer_eth_addr[dst_port], &eth_hdr->dst_addr);
+	rte_ether_addr_copy(&port_eth_addr[dst_port], &eth_hdr->src_addr);
+}
+
 /* Main function used by the processing threads.
  * Prints out some configuration details for the thread and then begins
  * performing packet RX and TX.
@@ -354,6 +473,10 @@ lcore_main(void *arg __rte_unused)
 			if (rx_c == 0)
 				continue;
 			pstats[src].rx += rx_c;
+
+			if (rewrite_icmp)
+				for (i = 0; i < rx_c; i++)
+					rewrite_icmp_eth_addr(buf[i], dst);
 
 			const uint16_t tx_c = rte_eth_tx_burst(dst, q_id, buf, rx_c);
 			pstats[dst].tx += tx_c;
@@ -473,6 +596,15 @@ main(int argc, char **argv)
 		if(proc_type == RTE_PROC_PRIMARY)
 			if (smp_port_init(ports[i], mp, (uint16_t)num_procs) < 0)
 				rte_exit(EXIT_FAILURE, "Error initialising ports\n");
+	}
+	if (rewrite_icmp) {
+		for (i = 0; i < num_ports; i++) {
+			ret = rte_eth_macaddr_get(ports[i], &port_eth_addr[ports[i]]);
+			if (ret < 0)
+				rte_exit(EXIT_FAILURE,
+					"Cannot get MAC address for port %u: %s\n",
+					ports[i], rte_strerror(-ret));
+		}
 	}
 	/* >8 End of primary instance initialization. */
 

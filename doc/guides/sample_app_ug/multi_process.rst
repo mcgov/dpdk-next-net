@@ -156,6 +156,16 @@ The first instance of the ``symmetric_mp`` process is the primary instance, with
   This identifies which ``symmetric_mp`` instance is being run,
   so that each process can read a unique receive queue on each network port.
 
+``--rewrite-icmp``
+  Rewrite the Ethernet addresses of forwarded IPv4 ICMP echo requests and replies.
+  The source address is set to the output port's MAC address and the destination
+  address is set to the peer address configured for that output port.
+
+``--peer-mac <port>,<mac>``
+  Configure the peer MAC address for an output port.
+  When ``--rewrite-icmp`` is used, this option is required once for every enabled port.
+  All primary and secondary processes must use the same settings.
+
 The secondary instance must be started with similar EAL parameters.
 Example:
 
