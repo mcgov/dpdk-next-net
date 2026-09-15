@@ -1376,7 +1376,7 @@ static void mana_intr_handler(void *arg);
 static void mana_reset_exit(struct mana_priv *priv);
 
 /* Delay before initiating reset exit after reset enter completes */
-#define MANA_RESET_TIMER_US (15 * 1000000ULL) /* 15 seconds */
+#define MANA_RESET_TIMER_US (45 * 1000000ULL) /* 45 seconds */
 
 /* Maximum time to keep retrying the PCI probe during reset exit */
 #define MANA_RESET_PROBE_TIMEOUT_SEC (10 * 60)
